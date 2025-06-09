@@ -1,4 +1,5 @@
 // server.js
+
 // =======================================================
 // --- IMPORTS & INITIALIZATION ---
 // =======================================================
@@ -10,76 +11,114 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 
-// --- Firebase Admin SDK Initialization ---
+// =======================================================
+// --- FIREBASE ADMIN SDK INITIALIZATION ---
+// =======================================================
 let serviceAccount;
-if (process.env.SERVICE_ACCOUNT_PATH) {
-  // Mounted secret file (Render “Secret File” / Docker volume)
-  serviceAccount = require(process.env.SERVICE_ACCOUNT_PATH);
-} else if (process.env.FIREBASE_CREDENTIALS) {
-  // Base64‐encoded JSON in env var
-  serviceAccount = JSON.parse(
-    Buffer.from(process.env.FIREBASE_CREDENTIALS, 'base64').toString('utf8')
-  );
-} else {
+try {
+  if (process.env.SERVICE_ACCOUNT_PATH) {
+    // Mounted secret file (Render Secret File)
+    serviceAccount = require(process.env.SERVICE_ACCOUNT_PATH);
+  } else if (process.env.FIREBASE_CREDENTIALS) {
+    // Base64‐encoded JSON in env var
+    serviceAccount = JSON.parse(
+      Buffer.from(process.env.FIREBASE_CREDENTIALS, 'base64').toString('utf8')
+    );
+  } else {
+    throw new Error('No Firebase credentials provided');
+  }
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+  console.log('✅ Firebase Admin SDK initialized successfully.');
+} catch (error) {
   console.error(
-    'FATAL: No Firebase credentials found. Set SERVICE_ACCOUNT_PATH or FIREBASE_CREDENTIALS.'
+    '❌ FATAL: Firebase Admin SDK initialization failed. ' +
+      'Make sure SERVICE_ACCOUNT_PATH or FIREBASE_CREDENTIALS is set.',
+    error.message
   );
   process.exit(1);
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-console.log('✅ Firebase Admin SDK initialized.');
-
-// --- Express Setup ---
+// =======================================================
+// --- EXPRESS APP & PORT ---
+// =======================================================
 const app = express();
-const port = process.env.PORT || 5000;
+const port = process.env.PORT; // Render will inject this
 
-// --- Nodemailer Setup ---
+// =======================================================
+// --- NODemailer (SMTP) SETUP ---
+// =======================================================
 let transporter = null;
-if (
-  process.env.SMTP_HOST &&
-  process.env.SMTP_PORT &&
-  process.env.SMTP_USER &&
-  process.env.SMTP_PASS
-) {
+const smtpHost = process.env.SMTP_HOST;
+const smtpPort = parseInt(process.env.SMTP_PORT, 10);
+const smtpSecure = process.env.SMTP_SECURE === 'true';
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+const emailFrom = process.env.EMAIL_FROM_ADDRESS || `"no-reply" <${smtpUser}>`;
+
+if (smtpHost && smtpPort && smtpUser && smtpPass) {
   transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: parseInt(process.env.SMTP_PORT, 10),
-    secure: process.env.SMTP_SECURE === 'true',
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
+    host: smtpHost,
+    port: smtpPort,
+    secure: smtpSecure,
+    auth: { user: smtpUser, pass: smtpPass },
   });
-  transporter.verify((err) => {
-    if (err) console.error('❌ SMTP config error:', err);
-    else console.log('✅ SMTP ready.');
+
+  transporter.verify((err, success) => {
+    if (err) {
+      console.error('❌ SMTP configuration error:', err.message);
+    } else {
+      console.log('✅ SMTP transporter ready.');
+    }
   });
 } else {
-  console.warn('⚠️  SMTP not configured; email endpoints will fail.');
+  console.warn(
+    '⚠️  SMTP credentials missing. Email endpoints will return errors.'
+  );
 }
 
-// --- Razorpay Setup ---
+// =======================================================
+// --- RAZORPAY SETUP ---
+// =======================================================
+const razorpayKeyId = process.env.RAZORPAY_KEY_ID;
+const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
+const applicationFee = parseInt(process.env.APPLICATION_FEE, 10);
 let razorpayInstance = null;
-if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+
+if (razorpayKeyId && razorpayKeySecret && applicationFee > 0) {
   razorpayInstance = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET,
+    key_id: razorpayKeyId,
+    key_secret: razorpayKeySecret,
   });
-  console.log('✅ Razorpay initialized.');
+  console.log('✅ Razorpay instance initialized.');
 } else {
-  console.warn('⚠️  Razorpay not configured; payment endpoints will fail.');
+  console.warn(
+    '⚠️  Razorpay credentials or APPLICATION_FEE missing/invalid. Payment endpoints will fail.'
+  );
 }
 
-// --- In‐Memory Stores & Middleware ---
+// =======================================================
+// --- IN-MEMORY OTP STORE & HELPERS ---
+// =======================================================
 const otpStore = {};
 const MAX_OTP_ATTEMPTS = 5;
 
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function generateToken() {
+  return crypto.randomBytes(20).toString('hex');
+}
+
+// =======================================================
+// --- MIDDLEWARE ---
+// =======================================================
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || 'http://ikon-edu.netlify.app',
+    origin: process.env.FRONTEND_URL,
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type'],
   })
@@ -87,20 +126,11 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- Helpers ---
-function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-function generateToken() {
-  return crypto.randomBytes(20).toString('hex');
-}
-
 // =======================================================
-// --- ROUTES (send-otp, verify-otp, reset-password, create-order, payment-verification, health) ---
-// (Copy exactly from your existing code; omitted here for brevity.)
+// --- AUTH & VERIFICATION ENDPOINTS ---
 // =======================================================
 
-// 1. Send Generic OTP Endpoint (For Registration & Password Reset)
+// 1. Send OTP
 app.post('/api/send-otp', async (req, res) => {
   const { email } = req.body;
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -108,12 +138,14 @@ app.post('/api/send-otp', async (req, res) => {
     return res.status(400).json({ message: 'Valid email address is required.' });
   }
   if (!transporter) {
-    return res.status(500).json({ message: 'Email service configuration error.' });
+    return res
+      .status(500)
+      .json({ message: 'Email service configuration error.' });
   }
 
   const otp = generateOTP();
-  const expiresAt = Date.now() + 10 * 60 * 1000; // OTP valid for 10 minutes
-  otpStore[email.toLowerCase()] = { otp, expiresAt, attempts: 0 }; 
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  otpStore[email.toLowerCase()] = { otp, expiresAt, attempts: 0 };
 
   const mailOptions = {
     from: emailFrom,
@@ -126,147 +158,189 @@ app.post('/api/send-otp', async (req, res) => {
     await transporter.sendMail(mailOptions);
     res.status(200).json({ message: `Verification code sent to ${email}.` });
   } catch (error) {
-    console.error(`Error sending OTP to ${email}:`, error);
+    console.error(`❌ Error sending OTP to ${email}:`, error.message);
     res.status(500).json({ message: 'Failed to send verification code.' });
   }
 });
 
-// 2. Verify OTP Endpoint (Returns a single-use token on success)
+// 2. Verify OTP
 app.post('/api/verify-otp', (req, res) => {
   const { email, otp } = req.body;
   if (!email || !otp) {
-    return res.status(400).json({ success: false, message: 'Email and OTP are required.' });
+    return res
+      .status(400)
+      .json({ success: false, message: 'Email and OTP are required.' });
   }
-  const lowerEmail = email.toLowerCase();
-  const storedOtpData = otpStore[lowerEmail];
 
-  if (!storedOtpData) {
-    return res.status(400).json({ success: false, message: 'Verification code not found. Please request a new one.' });
+  const stored = otpStore[email.toLowerCase()];
+  if (!stored) {
+    return res
+      .status(400)
+      .json({ success: false, message: 'No OTP found. Request a new one.' });
   }
-  if (Date.now() > storedOtpData.expiresAt) {
-    delete otpStore[lowerEmail];
-    return res.status(400).json({ success: false, message: 'Verification code has expired. Please request a new one.' });
+  if (Date.now() > stored.expiresAt) {
+    delete otpStore[email.toLowerCase()];
+    return res
+      .status(400)
+      .json({ success: false, message: 'OTP expired. Request a new one.' });
   }
-  if (storedOtpData.attempts >= MAX_OTP_ATTEMPTS) {
-    delete otpStore[lowerEmail];
-    return res.status(400).json({ success: false, message: 'Maximum attempts reached. Please request a new code.' });
+  if (stored.attempts >= MAX_OTP_ATTEMPTS) {
+    delete otpStore[email.toLowerCase()];
+    return res
+      .status(400)
+      .json({ success: false, message: 'Max attempts reached. Request again.' });
   }
-  
-  if (storedOtpData.otp === otp) {
-    const verificationToken = generateToken();
-    const tokenExpiresAt = Date.now() + 5 * 60 * 1000; // Token valid for 5 minutes
 
-    otpStore[lowerEmail].verificationToken = verificationToken;
-    otpStore[lowerEmail].tokenExpiresAt = tokenExpiresAt;
-    
-    res.status(200).json({ 
-      success: true, 
+  if (stored.otp === otp) {
+    const token = generateToken();
+    stored.verificationToken = token;
+    stored.tokenExpiresAt = Date.now() + 5 * 60 * 1000;
+    return res.status(200).json({
+      success: true,
       message: 'OTP verified successfully.',
-      verificationToken: verificationToken 
+      verificationToken: token,
     });
   } else {
-    otpStore[lowerEmail].attempts += 1;
-    res.status(400).json({ success: false, message: 'Invalid verification code.' });
+    stored.attempts += 1;
+    return res
+      .status(400)
+      .json({ success: false, message: 'Invalid verification code.' });
   }
 });
 
-// 3. Reset Password Endpoint (Requires a valid verification token)
+// 3. Reset Password
 app.post('/api/reset-password', async (req, res) => {
-    const { email, newPassword, verificationToken } = req.body;
-    if (!email || !newPassword || !verificationToken) {
-        return res.status(400).json({ message: 'Email, new password, and verification token are required.' });
-    }
-    if (newPassword.length < 6) {
-        return res.status(400).json({ message: 'Password must be at least 6 characters long.' });
-    }
+  const { email, newPassword, verificationToken } = req.body;
+  if (!email || !newPassword || !verificationToken) {
+    return res.status(400).json({
+      message: 'Email, new password, and verification token are required.',
+    });
+  }
+  if (newPassword.length < 6) {
+    return res
+      .status(400)
+      .json({ message: 'Password must be at least 6 characters.' });
+  }
 
-    const lowerEmail = email.toLowerCase();
-    const storedData = otpStore[lowerEmail];
+  const stored = otpStore[email.toLowerCase()];
+  if (
+    !stored ||
+    stored.verificationToken !== verificationToken ||
+    Date.now() > stored.tokenExpiresAt
+  ) {
+    return res
+      .status(401)
+      .json({ message: 'Invalid or expired verification token.' });
+  }
 
-    if (!storedData || storedData.verificationToken !== verificationToken || Date.now() > storedData.tokenExpiresAt) {
-        return res.status(401).json({ message: 'Invalid or expired verification token. Please start the process over.' });
+  try {
+    const user = await admin.auth().getUserByEmail(email.toLowerCase());
+    await admin.auth().updateUser(user.uid, { password: newPassword });
+    delete otpStore[email.toLowerCase()];
+    return res
+      .status(200)
+      .json({ success: true, message: 'Password reset successfully.' });
+  } catch (error) {
+    console.error('❌ Error resetting password:', error.code || error.message);
+    if (error.code === 'auth/user-not-found') {
+      return res.status(404).json({
+        message: 'No account found with that email address.',
+      });
     }
-    
-    try {
-        const userRecord = await admin.auth().getUserByEmail(lowerEmail);
-        await admin.auth().updateUser(userRecord.uid, { password: newPassword });
-        delete otpStore[lowerEmail];
-        res.status(200).json({ success: true, message: 'Password has been reset successfully. You can now log in.' });
-    } catch (error) {
-        console.error("Error during password reset:", error);
-        if (error.code === 'auth/user-not-found') {
-            return res.status(404).json({ message: 'No account is registered with this email address.' });
-        }
-        res.status(500).json({ message: 'An internal error occurred while resetting the password.' });
-    }
+    return res
+      .status(500)
+      .json({ message: 'Internal error during password reset.' });
+  }
 });
 
-
 // =======================================================
-// --- PAYMENT PROCESSING API ENDPOINTS ---
+// --- PAYMENT PROCESSING ENDPOINTS ---
 // =======================================================
 
-// 4. Create Razorpay Order Endpoint
+// 4. Create Razorpay Order
 app.post('/api/create-order', async (req, res) => {
   if (!razorpayInstance) {
-    return res.status(500).json({ message: 'Payment gateway is not configured on the server.' });
+    return res
+      .status(500)
+      .json({ message: 'Payment gateway not configured.' });
   }
+
   const { currency = 'INR', receiptNotes = {} } = req.body;
-  const compactTimestamp = Date.now().toString(36);
-  let generatedReceipt = `rcpt_app_${compactTimestamp}`;
-  const appId = receiptNotes.applicationId;
-  if (appId && typeof appId === 'string') {
-    const shortAppId = appId.substring(0, Math.min(appId.length, 10));
-    generatedReceipt += `_${shortAppId}`;
+  const timestamp = Date.now().toString(36);
+  let receipt = `rcpt_app_${timestamp}`;
+  if (receiptNotes.applicationId) {
+    const shortId = receiptNotes.applicationId.toString().slice(0, 10);
+    receipt += `_${shortId}`;
   }
-  generatedReceipt = generatedReceipt.substring(0, 40);
+  receipt = receipt.slice(0, 40);
+
   const options = {
     amount: applicationFee,
-    currency: currency,
-    receipt: generatedReceipt,
-    notes: receiptNotes
+    currency,
+    receipt,
+    notes: receiptNotes,
   };
+
   try {
     const order = await razorpayInstance.orders.create(options);
-    if (!order) {
-      return res.status(500).json({ message: 'Error creating Razorpay order.' });
-    }
-    res.json({ ...order, key_id: razorpayKeyId });
+    return res.json({ ...order, key_id: razorpayKeyId });
   } catch (error) {
-    console.error('Razorpay order creation error:', error);
-    const errorMessage = error.error && error.error.description ? error.error.description : "Could not create payment order.";
-    res.status(error.statusCode || 500).json({ message: errorMessage, error: error.error });
+    console.error('❌ Razorpay order error:', error.error || error.message);
+    const msg =
+      error.error?.description || 'Could not create payment order.';
+    return res.status(error.statusCode || 500).json({ message: msg });
   }
 });
 
-// 5. Verify Payment Signature Endpoint
+// 5. Verify Payment Signature
 app.post('/api/payment-verification', (req, res) => {
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-  const secret = process.env.RAZORPAY_KEY_SECRET;
-  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-    return res.status(400).json({ success: false, message: 'Missing payment details for verification.' });
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
+    req.body;
+
+  if (
+    !razorpay_order_id ||
+    !razorpay_payment_id ||
+    !razorpay_signature
+  ) {
+    return res
+      .status(400)
+      .json({ success: false, message: 'Missing payment details.' });
   }
-  if (!secret) {
-    console.error("FATAL: RAZORPAY_KEY_SECRET is not set. Cannot verify payment.");
-    return res.status(500).json({ success: false, message: "Server payment configuration error." });
+
+  if (!razorpayKeySecret) {
+    console.error(
+      '❌ FATAL: RAZORPAY_KEY_SECRET not set. Cannot verify payment.'
+    );
+    return res.status(500).json({
+      success: false,
+      message: 'Server payment configuration error.',
+    });
   }
-  const shasum = crypto.createHmac('sha256', secret);
-  shasum.update(`${razorpay_order_id}|${razorpay_payment_id}`);
-  const digest = shasum.digest('hex');
+
+  const hmac = crypto.createHmac('sha256', razorpayKeySecret);
+  hmac.update(`${razorpay_order_id}|${razorpay_payment_id}`);
+  const digest = hmac.digest('hex');
+
   if (digest === razorpay_signature) {
-    console.log('Payment verification successful for order:', razorpay_order_id);
-    res.json({
+    console.log('✅ Payment verified:', razorpay_order_id);
+    return res.json({
       success: true,
       message: 'Payment verified successfully.',
       orderId: razorpay_order_id,
-      paymentId: razorpay_payment_id
+      paymentId: razorpay_payment_id,
     });
   } else {
-    console.warn('Payment verification failed for order:', razorpay_order_id);
-    res.status(400).json({ success: false, message: 'Payment verification failed. Signature mismatch.' });
+    console.warn('⚠️  Payment signature mismatch:', razorpay_order_id);
+    return res
+      .status(400)
+      .json({ success: false, message: 'Signature mismatch.' });
   }
 });
-// Example: Health check
+
+// =======================================================
+// --- HEALTH CHECK & STARTUP ---
+// =======================================================
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'UP',
@@ -278,7 +352,21 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start
 app.listen(port, () => {
-  console.log(`🚀 Server listening on port ${port}`);
+  console.log(`🚀 Server running on port ${port}`);
+  if (!admin.apps.length) {
+    console.error(
+      '🔴 CRITICAL: Firebase Admin not initialized. Password reset will fail.'
+    );
+  }
+  if (!transporter) {
+    console.warn(
+      '🟠 WARNING: SMTP transporter not initialized. Email functionality will fail.'
+    );
+  }
+  if (!razorpayInstance) {
+    console.warn(
+      '🟠 WARNING: Razorpay instance not initialized. Payment functionality will fail.'
+    );
+  }
 });
